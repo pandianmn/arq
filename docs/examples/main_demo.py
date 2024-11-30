@@ -1,33 +1,38 @@
 import asyncio
-from aiohttp import ClientSession
+from httpx import AsyncClient
 from arq import create_pool
 from arq.connections import RedisSettings
 
+# Here you can configure the Redis connection.
+# The default is to connect to localhost:6379, no password.
+REDIS_SETTINGS = RedisSettings()
+
 async def download_content(ctx, url):
-    session: ClientSession = ctx['session']
-    async with session.get(url) as response:
-        content = await response.text()
-        print(f'{url}: {content:.80}...')
-    return len(content)
+    session: AsyncClient = ctx['session']
+    response = await session.get(url)
+    print(f'{url}: {response.text:.80}...')
+    return len(response.text)
 
 async def startup(ctx):
-    ctx['session'] = ClientSession()
+    ctx['session'] = AsyncClient()
 
 async def shutdown(ctx):
-    await ctx['session'].close()
+    await ctx['session'].aclose()
 
 async def main():
-    redis = await create_pool(RedisSettings())
+    redis = await create_pool(REDIS_SETTINGS)
     for url in ('https://facebook.com', 'https://microsoft.com', 'https://github.com'):
         await redis.enqueue_job('download_content', url)
 
 # WorkerSettings defines the settings to use when creating the work,
-# it's used by the arq cli.
-# For a list of available settings, see https://arq-docs.helpmanual.io/#arq.worker.Worker
+# It's used by the arq CLI.
+# redis_settings might be omitted here if using the default settings
+# For a list of all available settings, see https://arq-docs.helpmanual.io/#arq.worker.Worker
 class WorkerSettings:
     functions = [download_content]
     on_startup = startup
     on_shutdown = shutdown
+    redis_settings = REDIS_SETTINGS
 
 if __name__ == '__main__':
     asyncio.run(main())

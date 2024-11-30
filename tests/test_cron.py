@@ -1,47 +1,98 @@
 import asyncio
 import logging
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from random import random
 
 import pytest
+from pytest_mock import MockerFixture
 
 import arq
 from arq import Worker
 from arq.constants import in_progress_key_prefix
 from arq.cron import cron, next_cron
 
+tz = timezone(offset=timedelta(hours=3))
+
 
 @pytest.mark.parametrize(
     'previous,expected,kwargs',
     [
-        (datetime(2016, 6, 1, 12, 10, 10), datetime(2016, 6, 1, 12, 10, 20, microsecond=123_456), dict(second=20)),
-        (datetime(2016, 6, 1, 12, 10, 10), datetime(2016, 6, 1, 12, 11, 0, microsecond=123_456), dict(minute=11)),
-        (datetime(2016, 6, 1, 12, 10, 10), datetime(2016, 6, 1, 12, 10, 20), dict(second=20, microsecond=0)),
-        (datetime(2016, 6, 1, 12, 10, 10), datetime(2016, 6, 1, 12, 11, 0), dict(minute=11, microsecond=0)),
         (
-            datetime(2016, 6, 1, 12, 10, 11),
-            datetime(2017, 6, 1, 12, 10, 10, microsecond=123_456),
+            datetime(2016, 6, 1, 12, 10, 10, tzinfo=tz),
+            datetime(2016, 6, 1, 12, 10, 20, microsecond=123_456, tzinfo=tz),
+            dict(second=20),
+        ),
+        (
+            datetime(2016, 6, 1, 12, 10, 10, tzinfo=tz),
+            datetime(2016, 6, 1, 12, 11, 0, microsecond=123_456, tzinfo=tz),
+            dict(minute=11),
+        ),
+        (
+            datetime(2016, 6, 1, 12, 10, 10, tzinfo=tz),
+            datetime(2016, 6, 1, 12, 10, 20, tzinfo=tz),
+            dict(second=20, microsecond=0),
+        ),
+        (
+            datetime(2016, 6, 1, 12, 10, 10, tzinfo=tz),
+            datetime(2016, 6, 1, 12, 11, 0, tzinfo=tz),
+            dict(minute=11, microsecond=0),
+        ),
+        (
+            datetime(2016, 6, 1, 12, 10, 11, tzinfo=tz),
+            datetime(2017, 6, 1, 12, 10, 10, microsecond=123_456, tzinfo=tz),
             dict(month=6, day=1, hour=12, minute=10, second=10),
         ),
         (
-            datetime(2016, 6, 1, 12, 10, 10, microsecond=1),
-            datetime(2016, 7, 1, 12, 10, 10),
+            datetime(2016, 6, 1, 12, 10, 10, microsecond=1, tzinfo=tz),
+            datetime(2016, 7, 1, 12, 10, 10, tzinfo=tz),
             dict(day=1, hour=12, minute=10, second=10, microsecond=0),
         ),
-        (datetime(2032, 1, 31, 0, 0, 0), datetime(2032, 2, 28, 0, 0, 0, microsecond=123_456), dict(day=28)),
-        (datetime(2032, 1, 1, 0, 5), datetime(2032, 1, 1, 4, 0, microsecond=123_456), dict(hour=4)),
-        (datetime(2032, 1, 1, 0, 0), datetime(2032, 1, 1, 4, 2, microsecond=123_456), dict(hour=4, minute={2, 4, 6})),
-        (datetime(2032, 1, 1, 0, 5), datetime(2032, 1, 1, 4, 2, microsecond=123_456), dict(hour=4, minute={2, 4, 6})),
-        (datetime(2032, 2, 5, 0, 0, 0), datetime(2032, 3, 31, 0, 0, 0, microsecond=123_456), dict(day=31)),
         (
-            datetime(2001, 1, 1, 0, 0, 0),  # Monday
-            datetime(2001, 1, 7, 0, 0, 0, microsecond=123_456),
+            datetime(2032, 1, 31, 0, 0, 0, tzinfo=tz),
+            datetime(2032, 2, 28, 0, 0, 0, microsecond=123_456, tzinfo=tz),
+            dict(day=28),
+        ),
+        (
+            datetime(2032, 1, 1, 0, 5, tzinfo=tz),
+            datetime(2032, 1, 1, 4, 0, microsecond=123_456, tzinfo=tz),
+            dict(hour=4),
+        ),
+        (
+            datetime(2032, 1, 1, 0, 0, tzinfo=tz),
+            datetime(2032, 1, 1, 4, 2, microsecond=123_456, tzinfo=tz),
+            dict(hour=4, minute={2, 4, 6}),
+        ),
+        (
+            datetime(2032, 1, 1, 0, 5, tzinfo=tz),
+            datetime(2032, 1, 1, 4, 2, microsecond=123_456, tzinfo=tz),
+            dict(hour=4, minute={2, 4, 6}),
+        ),
+        (
+            datetime(2032, 2, 5, 0, 0, 0, tzinfo=tz),
+            datetime(2032, 3, 31, 0, 0, 0, microsecond=123_456, tzinfo=tz),
+            dict(day=31),
+        ),
+        (
+            datetime(2001, 1, 1, 0, 0, 0, tzinfo=tz),  # Monday
+            datetime(2001, 1, 7, 0, 0, 0, microsecond=123_456, tzinfo=tz),
             dict(weekday='Sun'),  # Sunday
         ),
-        (datetime(2001, 1, 1, 0, 0, 0), datetime(2001, 1, 7, 0, 0, 0, microsecond=123_456), dict(weekday=6)),  # Sunday
-        (datetime(2001, 1, 1, 0, 0, 0), datetime(2001, 11, 7, 0, 0, 0, microsecond=123_456), dict(month=11, weekday=2)),
-        (datetime(2001, 1, 1, 0, 0, 0), datetime(2001, 1, 3, 0, 0, 0, microsecond=123_456), dict(weekday='wed')),
+        (
+            datetime(2001, 1, 1, 0, 0, 0, tzinfo=tz),
+            datetime(2001, 1, 7, 0, 0, 0, microsecond=123_456, tzinfo=tz),
+            dict(weekday=6),
+        ),  # Sunday
+        (
+            datetime(2001, 1, 1, 0, 0, 0, tzinfo=tz),
+            datetime(2001, 11, 7, 0, 0, 0, microsecond=123_456, tzinfo=tz),
+            dict(month=11, weekday=2),
+        ),
+        (
+            datetime(2001, 1, 1, 0, 0, 0, tzinfo=tz),
+            datetime(2001, 1, 3, 0, 0, 0, microsecond=123_456, tzinfo=tz),
+            dict(weekday='wed'),
+        ),
     ],
 )
 def test_next_cron(previous, expected, kwargs):
@@ -49,6 +100,12 @@ def test_next_cron(previous, expected, kwargs):
     assert next_cron(previous, **kwargs) == expected
     diff = datetime.now() - start
     print(f'{diff.total_seconds() * 1000:0.3f}ms')
+
+
+def test_next_cron_preserves_tzinfo():
+    previous = datetime.fromisoformat('2016-06-01T12:10:10+02:00')
+    assert previous.tzinfo is not None
+    assert next_cron(previous, second=20).tzinfo is previous.tzinfo
 
 
 def test_next_cron_invalid():
@@ -110,6 +167,16 @@ async def test_job_successful(worker, caplog, arq_redis, poll_delay):
     assert await arq_redis.pttl(keys[0]) > 0.0
 
 
+async def test_calculate_next_is_called_with_aware_datetime(worker, mocker: MockerFixture):
+    worker: Worker = worker(cron_jobs=[cron(foobar, hour=1)])
+    spy_run_cron = mocker.spy(worker, worker.run_cron.__name__)
+
+    await worker.main()
+
+    assert spy_run_cron.call_args[0][0].tzinfo is not None
+    assert worker.cron_jobs[0].next_run.tzinfo is not None
+
+
 async def test_job_successful_on_specific_queue(worker, caplog):
     caplog.set_level(logging.INFO)
     worker: Worker = worker(
@@ -158,8 +225,8 @@ async def test_cron_cancelled(worker, mocker):
         poll_delay=0.01,
     )
     await worker.main()
-    assert worker.jobs_complete == 1
-    assert worker.jobs_retried == 1
+    assert worker.jobs_complete in (1, 2)
+    assert worker.jobs_retried == worker.jobs_complete
     assert worker.jobs_failed == 0
 
 

@@ -11,7 +11,7 @@ import msgpack
 import pytest
 from dirty_equals import IsInt, IsNow
 
-from arq.connections import ArqRedis
+from arq.connections import ArqRedis, RedisSettings
 from arq.constants import default_queue_name
 from arq.jobs import Job, JobDef, SerializationError
 from arq.utils import timestamp_ms
@@ -65,7 +65,9 @@ async def test_enqueue_job_nested(arq_redis: ArqRedis, worker):
     assert inner_result == 42
 
 
-async def test_enqueue_job_nested_custom_serializer(arq_redis_msgpack: ArqRedis, worker):
+async def test_enqueue_job_nested_custom_serializer(
+    arq_redis_msgpack: ArqRedis, test_redis_settings: RedisSettings, worker
+):
     async def foobar(ctx):
         return 42
 
@@ -78,6 +80,7 @@ async def test_enqueue_job_nested_custom_serializer(arq_redis_msgpack: ArqRedis,
     worker: Worker = worker(
         functions=[func(parent_job, name='parent_job'), func(foobar, name='foobar')],
         arq_redis=None,
+        redis_settings=test_redis_settings,
         job_serializer=msgpack.packb,
         job_deserializer=functools.partial(msgpack.unpackb, raw=False),
     )
@@ -90,7 +93,7 @@ async def test_enqueue_job_nested_custom_serializer(arq_redis_msgpack: ArqRedis,
     assert inner_result == 42
 
 
-async def test_enqueue_job_custom_queue(arq_redis: ArqRedis, worker):
+async def test_enqueue_job_custom_queue(arq_redis: ArqRedis, test_redis_settings: RedisSettings, worker):
     async def foobar(ctx):
         return 42
 
@@ -103,6 +106,7 @@ async def test_enqueue_job_custom_queue(arq_redis: ArqRedis, worker):
     worker: Worker = worker(
         functions=[func(parent_job, name='parent_job'), func(foobar, name='foobar')],
         arq_redis=None,
+        redis_settings=test_redis_settings,
         queue_name='spanner',
     )
 
@@ -238,11 +242,11 @@ async def test_cant_pickle_result(arq_redis: ArqRedis, worker):
 
 
 async def test_get_jobs(arq_redis: ArqRedis):
-    await arq_redis.enqueue_job('foobar', a=1, b=2, c=3)
+    await arq_redis.enqueue_job('foobar', a=1, b=2, c=3, _job_id='1')
     await asyncio.sleep(0.01)
-    await arq_redis.enqueue_job('second', 4, b=5, c=6)
+    await arq_redis.enqueue_job('second', 4, b=5, c=6, _job_id='2')
     await asyncio.sleep(0.01)
-    await arq_redis.enqueue_job('third', 7, b=8)
+    await arq_redis.enqueue_job('third', 7, b=8, _job_id='3')
     jobs = await arq_redis.queued_jobs()
     assert [dataclasses.asdict(j) for j in jobs] == [
         {
@@ -252,6 +256,7 @@ async def test_get_jobs(arq_redis: ArqRedis):
             'job_try': None,
             'enqueue_time': IsNow(tz='utc'),
             'score': IsInt(),
+            'job_id': '1',
         },
         {
             'function': 'second',
@@ -260,6 +265,7 @@ async def test_get_jobs(arq_redis: ArqRedis):
             'job_try': None,
             'enqueue_time': IsNow(tz='utc'),
             'score': IsInt(),
+            'job_id': '2',
         },
         {
             'function': 'third',
@@ -268,6 +274,7 @@ async def test_get_jobs(arq_redis: ArqRedis):
             'job_try': None,
             'enqueue_time': IsNow(tz='utc'),
             'score': IsInt(),
+            'job_id': '3',
         },
     ]
     assert jobs[0].score < jobs[1].score < jobs[2].score

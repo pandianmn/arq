@@ -2,24 +2,55 @@ import asyncio
 import functools
 import os
 import sys
+from typing import Generator
 
 import msgpack
 import pytest
+import redis.exceptions
+from redis.asyncio.retry import Retry
+from redis.backoff import NoBackoff
+from testcontainers.redis import RedisContainer
 
-from arq.connections import ArqRedis, create_pool
+from arq.connections import ArqRedis, RedisSettings, create_pool
 from arq.worker import Worker
 
 
 @pytest.fixture(name='loop')
-def _fix_loop(event_loop):
+def _fix_loop(event_loop: asyncio.AbstractEventLoop) -> asyncio.AbstractEventLoop:
     return event_loop
 
 
+@pytest.fixture(scope='session')
+def redis_version() -> str:
+    return os.getenv('ARQ_TEST_REDIS_VERSION', 'latest')
+
+
+@pytest.fixture(scope='session')
+def redis_container(redis_version: str) -> Generator[RedisContainer, None, None]:
+    with RedisContainer(f'redis:{redis_version}') as redis:
+        yield redis
+
+
+@pytest.fixture(scope='session')
+def test_redis_host(redis_container: RedisContainer) -> str:
+    return redis_container.get_container_host_ip()
+
+
+@pytest.fixture(scope='session')
+def test_redis_port(redis_container: RedisContainer) -> int:
+    return redis_container.get_exposed_port(redis_container.port_to_expose)
+
+
+@pytest.fixture(scope='session')
+def test_redis_settings(test_redis_host: str, test_redis_port: int) -> RedisSettings:
+    return RedisSettings(host=test_redis_host, port=test_redis_port)
+
+
 @pytest.fixture
-async def arq_redis(loop):
+async def arq_redis(test_redis_host: str, test_redis_port: int):
     redis_ = ArqRedis(
-        host='localhost',
-        port=6379,
+        host=test_redis_host,
+        port=test_redis_port,
         encoding='utf-8',
     )
 
@@ -31,13 +62,28 @@ async def arq_redis(loop):
 
 
 @pytest.fixture
-async def arq_redis_msgpack(loop):
+async def arq_redis_msgpack(test_redis_host: str, test_redis_port: int):
     redis_ = ArqRedis(
-        host='localhost',
-        port=6379,
+        host=test_redis_host,
+        port=test_redis_port,
         encoding='utf-8',
         job_serializer=msgpack.packb,
         job_deserializer=functools.partial(msgpack.unpackb, raw=False),
+    )
+    await redis_.flushall()
+    yield redis_
+    await redis_.close(close_connection_pool=True)
+
+
+@pytest.fixture
+async def arq_redis_retry(test_redis_host: str, test_redis_port: int):
+    redis_ = ArqRedis(
+        host=test_redis_host,
+        port=test_redis_port,
+        encoding='utf-8',
+        retry=Retry(backoff=NoBackoff(), retries=3),
+        retry_on_timeout=True,
+        retry_on_error=[redis.exceptions.ConnectionError],
     )
     await redis_.flushall()
     yield redis_
@@ -59,6 +105,28 @@ async def worker(arq_redis):
 
     if worker_:
         await worker_.close()
+
+
+@pytest.fixture
+async def worker_retry(arq_redis_retry):
+    worker_retry_: Worker = None
+
+    def create(functions=[], burst=True, poll_delay=0, max_jobs=10, arq_redis=arq_redis_retry, **kwargs):
+        nonlocal worker_retry_
+        worker_retry_ = Worker(
+            functions=functions,
+            redis_pool=arq_redis,
+            burst=burst,
+            poll_delay=poll_delay,
+            max_jobs=max_jobs,
+            **kwargs,
+        )
+        return worker_retry_
+
+    yield create
+
+    if worker_retry_:
+        await worker_retry_.close()
 
 
 @pytest.fixture(name='create_pool')

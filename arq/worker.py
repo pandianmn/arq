@@ -1,15 +1,15 @@
 import asyncio
+import contextlib
 import inspect
 import logging
 import signal
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from functools import partial
 from signal import Signals
 from time import time
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, Union, cast
 
-from pydantic.utils import import_string
 from redis.exceptions import ResponseError, WatchError
 
 from arq.cron import CronJob
@@ -20,6 +20,7 @@ from .constants import (
     abort_job_max_age,
     abort_jobs_ss,
     default_queue_name,
+    expires_extra_ms,
     health_check_key_suffix,
     in_progress_key_prefix,
     job_key_prefix,
@@ -27,10 +28,20 @@ from .constants import (
     result_key_prefix,
     retry_key_prefix,
 )
-from .utils import args_to_string, ms_to_datetime, poll, timestamp_ms, to_ms, to_seconds, to_unix_ms, truncate
+from .utils import (
+    args_to_string,
+    import_string,
+    ms_to_datetime,
+    poll,
+    timestamp_ms,
+    to_ms,
+    to_seconds,
+    to_unix_ms,
+    truncate,
+)
 
 if TYPE_CHECKING:
-    from .typing import SecondsTimedelta, StartupShutdown, WorkerCoroutine, WorkerSettingsType  # noqa F401
+    from .typing import SecondsTimedelta, StartupShutdown, WorkerCoroutine, WorkerSettingsType
 
 logger = logging.getLogger('arq.worker')
 no_result = object()
@@ -74,7 +85,8 @@ def func(
     else:
         coroutine_ = coroutine
 
-    assert asyncio.iscoroutinefunction(coroutine_), f'{coroutine_} is not a coroutine function'
+    if not asyncio.iscoroutinefunction(coroutine_):
+        raise RuntimeError(f'{coroutine_} is not a coroutine function')
     timeout = to_seconds(timeout)
     keep_result = to_seconds(keep_result)
 
@@ -140,8 +152,13 @@ class Worker:
     :param on_shutdown: coroutine function to run at shutdown
     :param on_job_start: coroutine function to run on job start
     :param on_job_end: coroutine function to run on job end
+    :param after_job_end: coroutine function to run after job has ended and results have been recorded
     :param handle_signals: default true, register signal handlers,
       set to false when running inside other async framework
+    :param job_completion_wait: time to wait before cancelling tasks after a signal.
+      Useful together with ``terminationGracePeriodSeconds`` in kubernetes,
+      when you want to make the pod complete jobs before shutting down.
+      The worker will not pick new tasks while waiting for shut down.
     :param max_jobs: maximum number of jobs to run at a time
     :param job_timeout: default job timeout (max run time)
     :param keep_result: default duration to keep job results for
@@ -158,6 +175,12 @@ class Worker:
     :param max_burst_jobs: the maximum number of jobs to process in burst mode (disabled with negative values)
     :param job_serializer: a function that serializes Python objects to bytes, defaults to pickle.dumps
     :param job_deserializer: a function that deserializes bytes into Python objects, defaults to pickle.loads
+    :param expires_extra_ms: the default length of time from when a job is expected to start
+     after which the job expires, defaults to 1 day in ms.
+    :param timezone: timezone used for evaluation of cron schedules,
+        defaults to system timezone
+    :param log_results: when set to true (default) results for successful jobs
+      will be logged
     """
 
     def __init__(
@@ -166,14 +189,16 @@ class Worker:
         *,
         queue_name: Optional[str] = default_queue_name,
         cron_jobs: Optional[Sequence[CronJob]] = None,
-        redis_settings: RedisSettings = None,
-        redis_pool: ArqRedis = None,
+        redis_settings: Optional[RedisSettings] = None,
+        redis_pool: Optional[ArqRedis] = None,
         burst: bool = False,
         on_startup: Optional['StartupShutdown'] = None,
         on_shutdown: Optional['StartupShutdown'] = None,
         on_job_start: Optional['StartupShutdown'] = None,
         on_job_end: Optional['StartupShutdown'] = None,
+        after_job_end: Optional['StartupShutdown'] = None,
         handle_signals: bool = True,
+        job_completion_wait: int = 0,
         max_jobs: int = 10,
         job_timeout: 'SecondsTimedelta' = 300,
         keep_result: 'SecondsTimedelta' = 3600,
@@ -189,6 +214,9 @@ class Worker:
         max_burst_jobs: int = -1,
         job_serializer: Optional[Serializer] = None,
         job_deserializer: Optional[Deserializer] = None,
+        expires_extra_ms: int = expires_extra_ms,
+        timezone: Optional[timezone] = None,
+        log_results: bool = True,
     ):
         self.functions: Dict[str, Union[Function, CronJob]] = {f.name: f for f in map(func, functions)}
         if queue_name is None:
@@ -199,16 +227,23 @@ class Worker:
         self.queue_name = queue_name
         self.cron_jobs: List[CronJob] = []
         if cron_jobs is not None:
-            assert all(isinstance(cj, CronJob) for cj in cron_jobs), 'cron_jobs, must be instances of CronJob'
+            if not all(isinstance(cj, CronJob) for cj in cron_jobs):
+                raise RuntimeError('cron_jobs, must be instances of CronJob')
             self.cron_jobs = list(cron_jobs)
             self.functions.update({cj.name: cj for cj in self.cron_jobs})
-        assert len(self.functions) > 0, 'at least one function or cron_job must be registered'
+        if len(self.functions) == 0:
+            raise RuntimeError('at least one function or cron_job must be registered')
         self.burst = burst
         self.on_startup = on_startup
         self.on_shutdown = on_shutdown
         self.on_job_start = on_job_start
         self.on_job_end = on_job_end
-        self.sem = asyncio.BoundedSemaphore(max_jobs)
+        self.after_job_end = after_job_end
+
+        self.max_jobs = max_jobs
+        self.sem = asyncio.BoundedSemaphore(max_jobs + 1)
+        self.job_counter: int = 0
+
         self.job_timeout_s = to_seconds(job_timeout)
         self.keep_result_s = to_seconds(keep_result)
         self.keep_result_forever = keep_result_forever
@@ -241,17 +276,28 @@ class Worker:
         self._last_health_check: float = 0
         self._last_health_check_log: Optional[str] = None
         self._handle_signals = handle_signals
+        self._job_completion_wait = job_completion_wait
         if self._handle_signals:
-            self._add_signal_handler(signal.SIGINT, self.handle_sig)
-            self._add_signal_handler(signal.SIGTERM, self.handle_sig)
+            if self._job_completion_wait:
+                self._add_signal_handler(signal.SIGINT, self.handle_sig_wait_for_completion)
+                self._add_signal_handler(signal.SIGTERM, self.handle_sig_wait_for_completion)
+            else:
+                self._add_signal_handler(signal.SIGINT, self.handle_sig)
+                self._add_signal_handler(signal.SIGTERM, self.handle_sig)
         self.on_stop: Optional[Callable[[Signals], None]] = None
         # whether or not to retry jobs on Retry and CancelledError
         self.retry_jobs = retry_jobs
         self.allow_abort_jobs = allow_abort_jobs
+        self.allow_pick_jobs: bool = True
         self.aborting_tasks: Set[str] = set()
         self.max_burst_jobs = max_burst_jobs
         self.job_serializer = job_serializer
         self.job_deserializer = job_deserializer
+        self.expires_extra_ms = expires_extra_ms
+        self.log_results = log_results
+
+        # default to system timezone
+        self.timezone = datetime.now().astimezone().tzinfo if timezone is None else timezone
 
     def run(self) -> None:
         """
@@ -302,6 +348,7 @@ class Worker:
                 job_deserializer=self.job_deserializer,
                 job_serializer=self.job_serializer,
                 default_queue_name=self.queue_name,
+                expires_extra_ms=self.expires_extra_ms,
             )
 
         logger.info('Starting worker for %d functions: %s', len(self.functions), ', '.join(self.functions))
@@ -310,7 +357,7 @@ class Worker:
         if self.on_startup:
             await self.on_startup(self.ctx)
 
-        async for _ in poll(self.poll_delay_s):  # noqa F841
+        async for _ in poll(self.poll_delay_s):
             await self._poll_iteration()
 
             if self.burst:
@@ -333,14 +380,14 @@ class Worker:
             if burst_jobs_remaining < 1:
                 return
             count = min(burst_jobs_remaining, count)
+        if self.allow_pick_jobs:
+            if self.job_counter < self.max_jobs:
+                now = timestamp_ms()
+                job_ids = await self.pool.zrangebyscore(
+                    self.queue_name, min=float('-inf'), start=self._queue_read_offset, num=count, max=now
+                )
 
-        async with self.sem:  # don't bother with zrangebyscore until we have "space" to run the jobs
-            now = timestamp_ms()
-            job_ids = await self.pool.zrangebyscore(
-                self.queue_name, min=float('-inf'), start=self._queue_read_offset, num=count, max=now
-            )
-
-        await self.start_jobs(job_ids)
+                await self.start_jobs(job_ids)
 
         if self.allow_abort_jobs:
             await self._cancel_aborted_jobs()
@@ -377,20 +424,34 @@ class Worker:
             self.aborting_tasks.update(aborted)
             await self.pool.zrem(abort_jobs_ss, *aborted)
 
+    def _release_sem_dec_counter_on_complete(self) -> None:
+        self.job_counter = self.job_counter - 1
+        self.sem.release()
+
     async def start_jobs(self, job_ids: List[bytes]) -> None:
         """
         For each job id, get the job definition, check it's not running and start it in a task
         """
         for job_id_b in job_ids:
             await self.sem.acquire()
+
+            if self.job_counter >= self.max_jobs:
+                self.sem.release()
+                return None
+
+            self.job_counter = self.job_counter + 1
+
             job_id = job_id_b.decode()
             in_progress_key = in_progress_key_prefix + job_id
             async with self.pool.pipeline(transaction=True) as pipe:
                 await pipe.watch(in_progress_key)
                 ongoing_exists = await pipe.exists(in_progress_key)
                 score = await pipe.zscore(self.queue_name, job_id)
-                if ongoing_exists or not score:
+                if ongoing_exists or not score or score > timestamp_ms():
                     # job already started elsewhere, or already finished and removed from queue
+                    # if score > ts_now,
+                    # it means probably the job was re-enqueued with a delay in another worker
+                    self.job_counter = self.job_counter - 1
                     self.sem.release()
                     logger.debug('job %s already running elsewhere', job_id)
                     continue
@@ -401,11 +462,12 @@ class Worker:
                     await pipe.execute()
                 except (ResponseError, WatchError):
                     # job already started elsewhere since we got 'existing'
+                    self.job_counter = self.job_counter - 1
                     self.sem.release()
                     logger.debug('multi-exec error, job %s already started elsewhere', job_id)
                 else:
-                    t = self.loop.create_task(self.run_job(job_id, score))
-                    t.add_done_callback(lambda _: self.sem.release())
+                    t = self.loop.create_task(self.run_job(job_id, int(score)))
+                    t.add_done_callback(lambda _: self._release_sem_dec_counter_on_complete())
                     self.tasks[job_id] = t
 
     async def run_job(self, job_id: str, score: int) -> None:  # noqa: C901
@@ -440,6 +502,7 @@ class Worker:
                 ref=f'{job_id}:{function_name}',
                 serializer=self.job_serializer,
                 queue_name=self.queue_name,
+                job_id=job_id,
             )
             await asyncio.shield(self.finish_failed_job(job_id, result_data_))
 
@@ -495,6 +558,7 @@ class Worker:
                 timestamp_ms(),
                 ref,
                 self.queue_name,
+                job_id=job_id,
                 serializer=self.job_serializer,
             )
             return await asyncio.shield(self.finish_failed_job(job_id, result_data))
@@ -534,7 +598,7 @@ class Worker:
                     exc_extra = exc_extra()
                 raise
             else:
-                result_str = '' if result is None else truncate(repr(result))
+                result_str = '' if result is None or not self.log_results else truncate(repr(result))
             finally:
                 del self.job_tasks[job_id]
 
@@ -588,6 +652,7 @@ class Worker:
                 finished_ms,
                 ref,
                 self.queue_name,
+                job_id=job_id,
                 serializer=self.job_serializer,
             )
 
@@ -605,6 +670,9 @@ class Worker:
                 keep_in_progress,
             )
         )
+
+        if self.after_job_end:
+            await self.after_job_end(ctx)
 
     async def finish_job(
         self,
@@ -654,7 +722,7 @@ class Worker:
             await tr.execute()
 
     async def heart_beat(self) -> None:
-        now = datetime.now()
+        now = datetime.now(tz=self.timezone)
         await self.record_health()
 
         cron_window_size = max(self.poll_delay_s, 0.5)  # Clamp the cron delay to 0.5
@@ -703,7 +771,9 @@ class Worker:
             f'{datetime.now():%b-%d %H:%M:%S} j_complete={self.jobs_complete} j_failed={self.jobs_failed} '
             f'j_retried={self.jobs_retried} j_ongoing={pending_tasks} queued={queued}'
         )
-        await self.pool.psetex(self.health_check_key, int((self.health_check_interval + 1) * 1000), info.encode())
+        await self.pool.psetex(  # type: ignore[no-untyped-call]
+            self.health_check_key, int((self.health_check_interval + 1) * 1000), info.encode()
+        )
         log_suffix = info[info.index('j_complete=') :]
         if self._last_health_check_log and log_suffix != self._last_health_check_log:
             logger.info('recording health: %s', info)
@@ -719,6 +789,55 @@ class Worker:
 
     def _jobs_started(self) -> int:
         return self.jobs_complete + self.jobs_retried + self.jobs_failed + len(self.tasks)
+
+    async def _sleep_until_tasks_complete(self) -> None:
+        """
+        Sleeps until all tasks are done. Used together with asyncio.wait_for()
+        """
+        while len(self.tasks):
+            await asyncio.sleep(0.1)
+
+    async def _wait_for_tasks_to_complete(self, signum: Signals) -> None:
+        """
+        Wait for tasks to complete, until `wait_for_job_completion_on_signal_second` has been reached.
+        """
+        with contextlib.suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(
+                self._sleep_until_tasks_complete(),
+                self._job_completion_wait,
+            )
+        logger.info(
+            'shutdown on %s, wait complete ◆ %d jobs complete ◆ %d failed ◆ %d retries ◆ %d ongoing to cancel',
+            signum.name,
+            self.jobs_complete,
+            self.jobs_failed,
+            self.jobs_retried,
+            sum(not t.done() for t in self.tasks.values()),
+        )
+        for t in self.tasks.values():
+            if not t.done():
+                t.cancel()
+        self.main_task and self.main_task.cancel()
+        self.on_stop and self.on_stop(signum)
+
+    def handle_sig_wait_for_completion(self, signum: Signals) -> None:
+        """
+        Alternative signal handler that allow tasks to complete within a given time before shutting down the worker.
+        Time can be configured using `wait_for_job_completion_on_signal_second`.
+        The worker will stop picking jobs when signal has been received.
+        """
+        sig = Signals(signum)
+        logger.info('Setting allow_pick_jobs to `False`')
+        self.allow_pick_jobs = False
+        logger.info(
+            'shutdown on %s ◆ %d jobs complete ◆ %d failed ◆ %d retries ◆ %d to be completed',
+            sig.name,
+            self.jobs_complete,
+            self.jobs_failed,
+            self.jobs_retried,
+            len(self.tasks),
+        )
+        self.loop.create_task(self._wait_for_tasks_to_complete(signum=sig))
 
     def handle_sig(self, signum: Signals) -> None:
         sig = Signals(signum)
@@ -762,7 +881,7 @@ def get_kwargs(settings_cls: 'WorkerSettingsType') -> Dict[str, NameError]:
 
 
 def create_worker(settings_cls: 'WorkerSettingsType', **kwargs: Any) -> Worker:
-    return Worker(**{**get_kwargs(settings_cls), **kwargs})  # type: ignore
+    return Worker(**{**get_kwargs(settings_cls), **kwargs})
 
 
 def run_worker(settings_cls: 'WorkerSettingsType', **kwargs: Any) -> Worker:

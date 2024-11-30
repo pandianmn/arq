@@ -3,6 +3,82 @@
 History
 -------
 
+v0.26.1 (2023-08-29)
+....................
+
+* Uses ``testcontainers`` to provide a redis instance for the unit tests by @chrisguidry in #470
+* Bump ``redis`` version from <5 to <6 by @Wh1isper in #460
+* Bump ``idna`` from 3.6 to 3.7 in /requirements by @dependabot in #444
+* Bump ``jinja2`` from 3.1.3 to 3.1.4 in /requirements by @dependabot in #452
+* Bump ``requests`` from 2.31.0 to 2.32.0 in /requirements by @dependabot in #461
+* Bump ``urllib3`` from 2.2.1 to 2.2.2 in /requirements by @dependabot in #464
+* Bump ``certifi`` from 2024.2.2 to 2024.7.4 in /requirements by @dependabot in #468
+
+v0.26.0 (2023-05-01)
+....................
+
+No changes since v0.26.0b1.
+
+v0.26.0b1 (2023-04-01)
+......................
+
+* Prevent worker getting stuck in terminating state by @JonasKs in #370
+* Fix redis pipeline created and not used by @iamlikeme in #374
+* Bump certifi from 2022.6.15 to 2022.12.7 in ``/requirements`` by @dependabot in #373
+* Use instance's default queue for ``queued_jobs`` default by @phy1729 in #368
+* Docs: Add details about reusing a unique job id by @ross-nordstrom in #391
+* Delete ``setup.py`` in #398
+* Adding a job counter to address ``Semaphore`` issues by @rm-21 in #408
+* docs: add documentation on how to retrieve running jobs by @JonasKs in #377
+* feat: add ``job_id`` to ``JobDef``, closing #376 by @JonasKs in #378
+* chore: update dependencies, fixing tests by @JonasKs in #382
+* refactor: refactor all asserts into raise ``<exception>``, close #371 by @JonasKs in #379
+* Fix: timezone info occasionally removed from cron job execution time by @iamlikeme in #383
+* 3.12 support, drop 3.7, uprev dependencies by @samuelcolvin in #439
+* Extend ``RedisSettings`` to include redis Retry Helper settings by @mernmic in #387
+* Allow to connect to Redis using a Unix socket URL… by @drygdryg in #392
+* Allow infinite retry by @vvmruder in #396
+* Allow ``max_connections`` to be set in RedisSettings by @danbox in #406
+* Improve ``RedisSettings`` explanation in ``main_demo.py`` by @RamonGiovane in #422
+* uprev to v0.26.0b1 by @samuelcolvin in #440
+
+v0.25 (2022-12-02)
+..................
+
+* Allow to opt-out from logging results by @iamlikeme in #352
+* Add timezone support for cron jobs by @iamlikeme in #354
+* connections: fix pipeline usage for exists command by @utkarshgupta137 in #366
+* Fix race condition causing incorrect status not found by @iamlikeme in #362
+* Adds ``after_job_end`` hook by @AngellusMortis in #355
+* Raise ``ResultNotFound`` when ``Job.result()`` finds no job and no result by @iamlikeme in #364
+* use ``3.11`` for testing #367
+* Signal handler to wait for task completion before shutting down by @JonasKs in #345
+
+v0.24 (2022-09-05)
+..................
+
+* Allow customisation of timezone in logs, #281
+* Add the ``username`` option to ``RedisSettings``, #299
+* Change primary branch name to ``main``, 40c8803
+* Add ``--custom-log-dict`` CLI option, #294
+* Fix error in case of pytz not being installed, #318
+* Support and test python 3.11, #327
+* Improve docs for parameter ``_expires`` in ``enqueue_job``, #313
+* Fix redis ssl support, #323
+* Fix recursion while waiting for redis connection, #311
+* switch from watchgod to watchfiles, #332
+* Simplify dependencies, drop pydantic as a dependency., #334
+* Allow use of ``unix_socket_path`` in ``RedisSettings``, #336
+* Allow user to configure a default job expiry-extra length, #303
+* Remove transaction around ``info`` command to support Redis 6.2.3, #338
+* Switch from ``setup.py`` to ``pyproject.toml``, #341
+* Support ``abort`` for deferred jobs, #307
+
+v0.23 (2022-08-23)
+..................
+
+No changes from **v0.23a1**.
+
 v0.23a1 (2022-03-09)
 ....................
 * Fix jobs timeout by @kiriusm2 in #248
